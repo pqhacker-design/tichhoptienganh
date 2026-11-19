@@ -17,7 +17,10 @@ def get_gemini_client(api_key: str = "") -> genai.Client:
         raise ValueError(
             "Bạn chưa nhập Gemini API Key. Vui lòng nhập khóa ở thanh bên trái để sử dụng."
         )
-    return genai.Client(api_key=key)
+    return genai.Client(
+        api_key=key,
+        http_options=types.HttpOptions(api_version="v1beta"),
+    )
 
 
 def validate_api_key(api_key: str) -> Tuple[bool, str]:
@@ -26,7 +29,10 @@ def validate_api_key(api_key: str) -> Tuple[bool, str]:
     if not key:
         return False, "Vui lòng nhập API Key."
     try:
-        client = genai.Client(api_key=key)
+        client = genai.Client(
+            api_key=key,
+            http_options=types.HttpOptions(api_version="v1beta"),
+        )
         client.models.generate_content(
             model=GEMINI_MODEL,
             contents="Reply with OK",
