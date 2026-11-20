@@ -2,20 +2,70 @@ import io
 import re
 from typing import Any, Dict, List, Tuple
 from docx import Document
-from docx.shared import RGBColor
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.oxml import OxmlElement
+from docx.shared import Pt, RGBColor
+from docx.text.paragraph import Paragraph
 from config import COLOR_ENGLISH_RGB, COLOR_IPA_RGB
 from document_reader import iter_word_body_blocks
 
 
-def _add_styled_run(paragraph, text: str, rgb: Tuple[int, int, int], italic: bool = False, bold: bool = False):
+def _add_styled_run(
+    paragraph: Paragraph,
+    text: str,
+    rgb: Tuple[int, int, int],
+    italic: bool = False,
+    bold: bool = False,
+):
     run = paragraph.add_run(text)
     run.font.color.rgb = RGBColor(*rgb)
     run.italic = italic
     run.bold = bold
+    # Kế thừa font và cỡ chữ từ đoạn gốc nếu có
+    for r in paragraph.runs:
+        if r is not run:
+            if r.font.name:
+                run.font.name = r.font.name
+            if r.font.size:
+                run.font.size = r.font.size
+            break
     return run
 
 
-def _insert_after_match_in_runs(paragraph, vi_term: str, en_text: str, ipa_text: str = "") -> bool:
+def _insert_paragraph_after(
+    paragraph: Paragraph,
+    text: str,
+    rgb: Tuple[int, int, int],
+    italic: bool = True,
+    bold: bool = False,
+) -> Paragraph:
+    """Chèn một đoạn văn mới ngay sau paragraph hiện tại để không làm giãn chữ đoạn gốc."""
+    new_p_xml = OxmlElement("w:p")
+    paragraph._p.addnext(new_p_xml)
+    new_p = Paragraph(new_p_xml, paragraph._parent)
+    new_p.alignment = WD_ALIGN_PARAGRAPH.LEFT
+    new_p.paragraph_format.space_before = Pt(2)
+    new_p.paragraph_format.space_after = Pt(4)
+
+    run = new_p.add_run(text)
+    run.font.color.rgb = RGBColor(*rgb)
+    run.italic = italic
+    run.bold = bold
+    for r in paragraph.runs:
+        if r.font.name:
+            run.font.name = r.font.name
+        if r.font.size:
+            run.font.size = r.font.size
+        break
+    return new_p
+
+
+def _insert_after_match_in_runs(
+    paragraph: Paragraph,
+    vi_term: str,
+    en_text: str,
+    ipa_text: str = "",
+) -> bool:
     """
     Chèn tiếng Anh ngay sau thuật ngữ tiếng Việt trong cùng run (nếu tìm thấy),
     bảo toàn toàn bộ các run khác và XML công thức/hình ảnh.
@@ -48,6 +98,8 @@ def _insert_after_match_in_runs(paragraph, vi_term: str, en_text: str, ipa_text:
                 ipa_run.italic = True
                 if run.font.size:
                     ipa_run.font.size = run.font.size
+                if run.font.name:
+                    ipa_run.font.name = run.font.name
                 last_r.addnext(ipa_run._r)
                 last_r = ipa_run._r
 
@@ -129,8 +181,10 @@ def integrate_word_multi_lesson(
             "positions_integrated": 0,
         })
 
-    # Duyệt toàn bộ body đúng 1 lần theo block_index
-    for block_idx, (kind, obj) in enumerate(iter_word_body_blocks(doc)):
+    # Cố định danh sách block gốc trước khi chèn đoạn mới để không lệch block_idx
+    original_blocks = list(iter_word_body_blocks(doc))
+
+    for block_idx, (kind, obj) in enumerate(original_blocks):
         owner = None
         for al in active_lessons:
             if al["start"] <= block_idx <= al["end"]:
@@ -139,7 +193,7 @@ def integrate_word_multi_lesson(
         if owner is None:
             continue
 
-        target_paragraphs = []
+        target_paragraphs: List[Paragraph] = []
         if kind == "paragraph":
             target_paragraphs.append(obj)
         elif kind == "table":
@@ -160,11 +214,12 @@ def integrate_word_multi_lesson(
                         _add_styled_run(p, f" ({en_h})", COLOR_ENGLISH_RGB, bold=True)
                         owner["positions_integrated"] += 1
 
+                        # Chèn Classroom English thành đoạn mới bên dưới (không dùng \n để tránh giãn chữ)
                         for cmd in owner["commands"]:
                             if cmd["id"] not in owner["used_cmds"]:
-                                _add_styled_run(
+                                _insert_paragraph_after(
                                     p,
-                                    f"\n[Classroom English: {cmd['en']} — {cmd['vi']}]",
+                                    f"[Classroom English: {cmd['en']} — {cmd['vi']}]",
                                     COLOR_ENGLISH_RGB,
                                     italic=True,
                                 )
@@ -175,7 +230,9 @@ def integrate_word_multi_lesson(
 
             # 2. Thuật ngữ cốt lõi (chỉ dùng bộ của owner, lặp tối đa 3 lần trong bài)
             for k in owner["keywords"]:
-                vi_k, en_k, ipa_k = k.get("vi", "").strip(), k.get("en", "").strip(), k.get("ipa", "").strip()
+                vi_k = k.get("vi", "").strip()
+                en_k = k.get("en", "").strip()
+                ipa_k = k.get("ipa", "").strip()
                 if not vi_k or not en_k or owner["kw_hits"][vi_k] >= 3:
                     continue
                 ipa_to_add = ipa_k if owner["kw_hits"][vi_k] == 0 else ""
@@ -209,7 +266,12 @@ def integrate_word_multi_lesson(
                     _add_styled_run(rc[2].paragraphs[0], k.get("ipa", ""), COLOR_IPA_RGB, italic=True)
             for act in al["practices"]:
                 p_a = doc.add_paragraph()
-                _add_styled_run(p_a, f"• [{act.get('type', 'Practice')}] {act.get('title', '')}: ", COLOR_ENGLISH_RGB, bold=True)
+                _add_styled_run(
+                    p_a,
+                    f"• [{act.get('type', 'Practice')}] {act.get('title', '')}: ",
+                    COLOR_ENGLISH_RGB,
+                    bold=True,
+                )
                 p_a.add_run(act.get("content", ""))
                 al["positions_integrated"] += 1
 
