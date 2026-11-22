@@ -6,7 +6,7 @@ from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml import OxmlElement
 from docx.shared import Pt, RGBColor
 from docx.text.paragraph import Paragraph
-from config import COLOR_ENGLISH_RGB, COLOR_IPA_RGB
+from config import COLOR_BLOCK_RGB, COLOR_ENGLISH_RGB, COLOR_IPA_RGB, INTEGRATION_LEVELS
 from document_reader import iter_word_body_blocks
 
 
@@ -21,7 +21,6 @@ def _add_styled_run(
     run.font.color.rgb = RGBColor(*rgb)
     run.italic = italic
     run.bold = bold
-    # Kế thừa font và cỡ chữ từ đoạn gốc nếu có
     for r in paragraph.runs:
         if r is not run:
             if r.font.name:
@@ -66,16 +65,11 @@ def _insert_after_match_in_runs(
     en_text: str,
     ipa_text: str = "",
 ) -> bool:
-    """
-    Chèn tiếng Anh ngay sau thuật ngữ tiếng Việt trong cùng run (nếu tìm thấy),
-    bảo toàn toàn bộ các run khác và XML công thức/hình ảnh.
-    """
     if not vi_term or en_text.lower() in paragraph.text.lower():
         return False
 
     pattern = re.compile(re.escape(vi_term), re.IGNORECASE)
 
-    # Trường hợp 1: Thuật ngữ nằm gọn trong một run (giữ nguyên 100% XML khác)
     for run in paragraph.runs:
         match = pattern.search(run.text)
         if match:
@@ -117,7 +111,6 @@ def _insert_after_match_in_runs(
                 last_r.addnext(after_run._r)
             return True
 
-    # Trường hợp 2: Thuật ngữ bị tách qua nhiều run nhưng đoạn có chứa thuật ngữ
     if pattern.search(paragraph.text):
         _add_styled_run(paragraph, f" [{vi_term}: {en_text}", COLOR_ENGLISH_RGB)
         if ipa_text:
@@ -128,15 +121,17 @@ def _insert_after_match_in_runs(
     return False
 
 
+def _normalize_text(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").strip().lower())
+
+
 def integrate_word_multi_lesson(
     file_bytes: bytes,
     lessons: List[Dict[str, Any]],
+    integration_level: int = 1,
 ) -> Tuple[bytes, List[Dict[str, Any]]]:
     """
-    Tích hợp trực tiếp nhiều bài học vào cùng một file Word gốc.
-    - Chỉ tích hợp vào các bài có selected=True và analysis != None.
-    - Mỗi bài chỉ tác động đúng trong phạm vi [start_index, end_index].
-    - Bài không được chọn được giữ nguyên 100%.
+    Tích hợp trực tiếp nhiều bài học vào cùng một file Word gốc theo Mức độ 1, 2 hoặc 3.
     """
     doc = Document(io.BytesIO(file_bytes))
     lesson_reports: List[Dict[str, Any]] = []
@@ -147,6 +142,7 @@ def integrate_word_multi_lesson(
             lesson_reports.append({
                 "Bài học": ls["title"],
                 "Phạm vi": f"Block {ls['start_index']}–{ls['end_index']}",
+                "Mức độ": f"Mức {integration_level}",
                 "Số từ khóa": 0,
                 "Số vị trí tích hợp": 0,
                 "Trạng thái": "Giữ nguyên (Không chọn)",
@@ -156,6 +152,7 @@ def integrate_word_multi_lesson(
             lesson_reports.append({
                 "Bài học": ls["title"],
                 "Phạm vi": f"Block {ls['start_index']}–{ls['end_index']}",
+                "Mức độ": f"Mức {integration_level}",
                 "Số từ khóa": 0,
                 "Số vị trí tích hợp": 0,
                 "Trạng thái": "Chưa phân tích / Chưa duyệt",
@@ -163,25 +160,30 @@ def integrate_word_multi_lesson(
             continue
 
         analysis = ls["analysis"]
+        ls_level = analysis.get("integration_level", integration_level)
         kws = [k for k in analysis.get("keywords", []) if k.get("approved")]
         hdrs = [h for h in analysis.get("bilingual_headers", []) if h.get("approved")]
         cmds = [c for c in analysis.get("classroom_english", []) if c.get("approved")]
+        blocks = [b for b in analysis.get("bilingual_blocks", []) if b.get("approved")]
         pracs = [p for p in analysis.get("practice_activities", []) if p.get("approved")]
 
         active_lessons.append({
             "meta": ls,
+            "level": ls_level,
             "start": ls["start_index"],
             "end": ls["end_index"],
             "keywords": kws,
             "headers": hdrs,
             "commands": cmds,
+            "bilingual_blocks": blocks,
             "practices": pracs,
             "kw_hits": {k["vi"]: 0 for k in kws},
             "used_cmds": set(),
+            "used_blocks": set(),
             "positions_integrated": 0,
         })
 
-    # Cố định danh sách block gốc trước khi chèn đoạn mới để không lệch block_idx
+    # Cố định danh sách block gốc trước khi chèn đoạn mới
     original_blocks = list(iter_word_body_blocks(doc))
 
     for block_idx, (kind, obj) in enumerate(original_blocks):
@@ -197,16 +199,20 @@ def integrate_word_multi_lesson(
         if kind == "paragraph":
             target_paragraphs.append(obj)
         elif kind == "table":
+            seen_tcs = set()
             for row in obj.rows:
                 for cell in row.cells:
-                    target_paragraphs.extend(cell.paragraphs)
+                    if cell._tc not in seen_tcs:
+                        seen_tcs.add(cell._tc)
+                        target_paragraphs.extend(cell.paragraphs)
 
         for p in target_paragraphs:
             text = p.text.strip()
             if not text:
                 continue
+            norm_text = _normalize_text(text)
 
-            # 1. Tiêu đề hoạt động song ngữ (chỉ dùng bộ của owner)
+            # 1. Tiêu đề hoạt động song ngữ + Khẩu lệnh lớp học
             for h in owner["headers"]:
                 vi_h, en_h = h.get("vi", "").strip(), h.get("en", "").strip()
                 if vi_h and en_h and len(text) < 120:
@@ -214,7 +220,6 @@ def integrate_word_multi_lesson(
                         _add_styled_run(p, f" ({en_h})", COLOR_ENGLISH_RGB, bold=True)
                         owner["positions_integrated"] += 1
 
-                        # Chèn Classroom English thành đoạn mới bên dưới (không dùng \n để tránh giãn chữ)
                         for cmd in owner["commands"]:
                             if cmd["id"] not in owner["used_cmds"]:
                                 _insert_paragraph_after(
@@ -228,31 +233,55 @@ def integrate_word_multi_lesson(
                                 break
                         break
 
-            # 2. Thuật ngữ cốt lõi (chỉ dùng bộ của owner, lặp tối đa 3 lần trong bài)
+            # 2. Thuật ngữ cốt lõi (Keywords)
+            max_repeats = 3 if owner["level"] == 1 else 4
             for k in owner["keywords"]:
                 vi_k = k.get("vi", "").strip()
                 en_k = k.get("en", "").strip()
                 ipa_k = k.get("ipa", "").strip()
-                if not vi_k or not en_k or owner["kw_hits"][vi_k] >= 3:
+                if not vi_k or not en_k or owner["kw_hits"][vi_k] >= max_repeats:
                     continue
                 ipa_to_add = ipa_k if owner["kw_hits"][vi_k] == 0 else ""
                 if _insert_after_match_in_runs(p, vi_k, en_k, ipa_to_add):
                     owner["kw_hits"][vi_k] += 1
                     owner["positions_integrated"] += 1
 
-    # Bổ sung phụ lục tổng hợp theo từng bài ở cuối tài liệu
+            # 3. Các đoạn song ngữ trọng tâm (áp dụng cho Mức độ 2 và Mức độ 3)
+            if owner["level"] >= 2:
+                for blk in owner["bilingual_blocks"]:
+                    if blk["id"] in owner["used_blocks"]:
+                        continue
+                    anchor = _normalize_text(blk.get("vi_anchor", ""))
+                    en_block = blk.get("en_text", "").strip()
+                    if not anchor or not en_block:
+                        continue
+                    # Khớp theo đoạn mỏ neo (tối thiểu 15 ký tự hoặc toàn bộ anchor nếu ngắn)
+                    anchor_key = anchor[:40]
+                    if anchor_key in norm_text:
+                        prefix = f"[{blk.get('section_type', 'English')}] " if owner["level"] == 2 else ""
+                        _insert_paragraph_after(
+                            p,
+                            f"→ {prefix}{en_block}",
+                            COLOR_BLOCK_RGB,
+                            italic=False,
+                        )
+                        owner["used_blocks"].add(blk["id"])
+                        owner["positions_integrated"] += 1
+
+    # Phụ lục tổng hợp cuối tài liệu
     if active_lessons:
+        lvl_name = INTEGRATION_LEVELS.get(integration_level, INTEGRATION_LEVELS[1])["name"].upper()
         doc.add_paragraph("")
         p_head = doc.add_paragraph()
         _add_styled_run(
             p_head,
-            "PHỤ LỤC TỪ KHÓA & HOẠT ĐỘNG CỦNG CỐ THEO TỪNG BÀI (MỨC ĐỘ 1)",
+            f"PHỤ LỤC TÍCH HỢP TIẾNG ANH ({lvl_name} – TT 94/2026/TT-BGDĐT)",
             COLOR_ENGLISH_RGB,
             bold=True,
         )
         for al in active_lessons:
             p_lt = doc.add_paragraph()
-            _add_styled_run(p_lt, f"▶ {al['meta']['title']}", COLOR_ENGLISH_RGB, bold=True)
+            _add_styled_run(p_lt, f"▶ {al['meta']['title']} (Mức độ {al['level']})", COLOR_ENGLISH_RGB, bold=True)
             if al["keywords"]:
                 tbl = doc.add_table(rows=1, cols=3)
                 tbl.style = "Table Grid"
@@ -264,6 +293,18 @@ def integrate_word_multi_lesson(
                     rc[0].text = k.get("vi", "")
                     _add_styled_run(rc[1].paragraphs[0], k.get("en", ""), COLOR_ENGLISH_RGB, bold=True)
                     _add_styled_run(rc[2].paragraphs[0], k.get("ipa", ""), COLOR_IPA_RGB, italic=True)
+
+            # Nếu còn đoạn song ngữ Mức 2/3 chưa khớp tự động trong bài -> đưa vào phụ lục để không mất nội dung
+            unplaced_blocks = [b for b in al["bilingual_blocks"] if b["id"] not in al["used_blocks"]]
+            if unplaced_blocks:
+                p_ub = doc.add_paragraph()
+                _add_styled_run(p_ub, "Nội dung song ngữ bổ sung (Mức độ 2/3):", COLOR_BLOCK_RGB, bold=True)
+                for b in unplaced_blocks:
+                    p_b = doc.add_paragraph()
+                    _add_styled_run(p_b, f"• [{b.get('section_type', 'English')}] ", COLOR_BLOCK_RGB, bold=True)
+                    _add_styled_run(p_b, b.get("en_text", ""), COLOR_BLOCK_RGB)
+                    al["positions_integrated"] += 1
+
             for act in al["practices"]:
                 p_a = doc.add_paragraph()
                 _add_styled_run(
@@ -278,6 +319,7 @@ def integrate_word_multi_lesson(
             lesson_reports.append({
                 "Bài học": al["meta"]["title"],
                 "Phạm vi": f"Block {al['start']}–{al['end']}",
+                "Mức độ": f"Mức {al['level']}",
                 "Số từ khóa": len(al["keywords"]),
                 "Số vị trí tích hợp": al["positions_integrated"],
                 "Trạng thái": "Hoàn thành",
