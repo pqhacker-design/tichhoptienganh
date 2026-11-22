@@ -7,17 +7,12 @@ def run_multi_lesson_integration(
     file_bytes: bytes,
     file_type: str,
     lessons: List[Dict[str, Any]],
+    integration_level: int = 1,
 ) -> Tuple[bytes, List[Dict[str, Any]], Dict[str, Any]]:
-    """
-    Thực hiện tích hợp Multi-Lesson và trả về:
-    - out_bytes: file gốc đã tích hợp
-    - lesson_reports: báo cáo từng bài
-    - completeness: đối chiếu tính đầy đủ trước khi xuất
-    """
     if file_type == "docx":
-        out_bytes, lesson_reports = integrate_word_multi_lesson(file_bytes, lessons)
+        out_bytes, lesson_reports = integrate_word_multi_lesson(file_bytes, lessons, integration_level)
     elif file_type == "pptx":
-        out_bytes, lesson_reports = integrate_pptx_multi_lesson(file_bytes, lessons)
+        out_bytes, lesson_reports = integrate_pptx_multi_lesson(file_bytes, lessons, integration_level)
     else:
         raise ValueError(f"Định dạng không hỗ trợ: {file_type}")
 
